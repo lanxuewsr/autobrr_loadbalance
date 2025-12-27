@@ -28,6 +28,7 @@ TASK_PROCESSOR_SLEEP = 1
 ERROR_RETRY_SLEEP = 5
 RECONNECT_INTERVAL = 180
 CONNECTION_TIMEOUT = 10
+DEFAULT_STATUS_UPDATE_INTERVAL = 30  # 默认状态更新间隔
 
 # 网络和存储常量
 BYTES_TO_KB = 1024
@@ -42,7 +43,9 @@ ANNOUNCE_WINDOW_TOLERANCE = 5
 SUPPORTED_SORT_KEYS = {
     'upload_speed': '上传速度',
     'download_speed': '下载速度',
-    'active_downloads': '活跃下载数'
+    'active_downloads': '活跃下载数',
+    'free_space': '剩余空间',
+    'round_robin': '轮流推送'
 }
 DEFAULT_PRIMARY_SORT_KEY = 'upload_speed'
 
@@ -152,6 +155,16 @@ class PendingTorrent:
     category: Optional[str] = None
 
 
+@dataclass
+class MonitoredTorrent:
+    """待监控快速汇报的种子"""
+    instance_name: str
+    torrent_hash: str
+    torrent_name: str
+    added_time: datetime = field(default_factory=datetime.now)
+    retry_count: int = 0
+
+
 class QBittorrentLoadBalancer:
     """qBittorrent负载均衡器"""
     
@@ -161,7 +174,10 @@ class QBittorrentLoadBalancer:
         self.pending_torrents: List[PendingTorrent] = []
         self.pending_torrents_lock = threading.Lock()
         self.instances_lock = threading.Lock()
-        self.announce_retry_counts = {} # 用于跟踪每个种子的汇报重试次数
+        self.announce_retry_counts = {} # 用于跟踪每个种子的汇报重试次数（兼容保留）
+        self.round_robin_index = 0  # 轮流推送模式的索引
+        self.monitored_torrents: Dict[str, MonitoredTorrent] = {}  # 待监控的种子列表，key为torrent_hash
+        self.monitored_torrents_lock = threading.Lock()  # 监控列表的锁
         
         # 重新配置日志（支持文件输出）
         self._setup_logging()
@@ -250,11 +266,18 @@ class QBittorrentLoadBalancer:
         # 设置快速汇报间隔默认值，并限制在2-10秒范围内
         fast_interval = self.config.get('fast_announce_interval', 3)
         if not isinstance(fast_interval, (int, float)) or fast_interval < 2 or fast_interval > 10:
-            logger.warning(f"fast_announce_interval 值无效 ({fast_interval})，必须在2-10秒范围内，使用默认值4秒")
+            logger.warning(f"fast_announce_interval 值无效 ({fast_interval})，必须在2-10秒范围内，使用默认值3秒")
             fast_interval = 3
         self.config['fast_announce_interval'] = fast_interval
         
-        logger.info(f"状态更新间隔配置：快速检查={fast_interval}秒，正常检查={fast_interval * 2}秒")
+        # 设置状态更新间隔默认值
+        status_interval = self.config.get('status_update_interval', DEFAULT_STATUS_UPDATE_INTERVAL)
+        if not isinstance(status_interval, (int, float)) or status_interval < 5:
+            logger.warning(f"status_update_interval 值无效 ({status_interval})，必须>=5秒，使用默认值{DEFAULT_STATUS_UPDATE_INTERVAL}秒")
+            status_interval = DEFAULT_STATUS_UPDATE_INTERVAL
+        self.config['status_update_interval'] = status_interval
+        
+        logger.info(f"间隔配置：状态更新={status_interval}秒，快速汇报检查={fast_interval}秒")
 
     def _init_instances(self) -> None:
         """初始化qBittorrent实例连接"""
@@ -755,24 +778,58 @@ class QBittorrentLoadBalancer:
             return instance.download_speed
         elif primary_sort_key == 'active_downloads':
             return float(instance.active_downloads)
+        elif primary_sort_key == 'free_space':
+            # 使用负值使得空间大的排在前面
+            return -float(instance.free_space)
         else:
             # 默认使用上传速度
             return instance.upload_speed
         
-    def _select_best_instance(self) -> Optional[InstanceInfo]:
-        """选择最佳的实例来分配新任务"""
+    def _select_best_instance(self, exclude_instances: List[InstanceInfo] = None) -> Optional[InstanceInfo]:
+        """选择最佳的实例来分配新任务
+        
+        Args:
+            exclude_instances: 要排除的实例列表（用于故障转移时跳过已失败的实例）
+        """
+        exclude_instances = exclude_instances or []
+        
         with self.instances_lock:
             available_instances = [
                 instance for instance in self.instances 
                 if instance.is_connected and 
                 instance.new_tasks_count < self.config['max_new_tasks_per_instance'] and
                 instance.free_space > instance.reserved_space and
-                self._is_traffic_within_limit(instance)
+                self._is_traffic_within_limit(instance) and
+                instance not in exclude_instances
             ]
             
             if not available_instances:
                 return None
+            
+            primary_sort_key = self.config.get('primary_sort_key', DEFAULT_PRIMARY_SORT_KEY)
+            
+            # 轮流推送模式
+            if primary_sort_key == 'round_robin':
+                # 构建按原始顺序的可用实例索引映射
+                instance_indices = {inst: idx for idx, inst in enumerate(self.instances)}
+                available_instances.sort(key=lambda x: instance_indices[x])
                 
+                # 找到从当前索引开始的下一个可用实例
+                total_instances = len(self.instances)
+                for _ in range(total_instances):
+                    current_idx = self.round_robin_index % total_instances
+                    current_instance = self.instances[current_idx]
+                    if current_instance in available_instances:
+                        selected = current_instance
+                        self.round_robin_index = (current_idx + 1) % total_instances
+                        logger.debug(f"轮流推送选择实例 {selected.name}（索引={current_idx}），"
+                                    f"下次索引={self.round_robin_index}，"
+                                    f"空闲空间={selected.free_space/BYTES_TO_GB:.1f}GB")
+                        return selected
+                    self.round_robin_index = (current_idx + 1) % total_instances
+                return None
+                
+            # 其他排序模式
             # 按可配置算法排序：主要因素（小值优先），次要因素是任务计数（小值优先），第三因素是硬盘空间（大值优先）
             available_instances.sort(key=lambda x: (
                 self._get_primary_sort_value(x),  # 主要因素：小值优先
@@ -781,7 +838,6 @@ class QBittorrentLoadBalancer:
             ))
             
             selected = available_instances[0]
-            primary_sort_key = self.config.get('primary_sort_key', DEFAULT_PRIMARY_SORT_KEY)
             primary_value = self._get_primary_sort_value(selected)
             
             logger.debug(f"选择实例 {selected.name}：" 
@@ -817,6 +873,11 @@ class QBittorrentLoadBalancer:
                 if torrent.category:
                     log_msg += f"（分类：{torrent.category}）"
                 logger.info(log_msg)
+                
+                # 如果启用了快速汇报，将种子添加到监控列表
+                if self.config.get('fast_announce_enabled', False):
+                    self._schedule_torrent_monitoring(instance, torrent)
+                
                 return True
             else:
                 logger.error(f"添加种子失败 - 实例：{instance.name}，种子：{torrent.release_name}，结果：{result}")
@@ -825,6 +886,44 @@ class QBittorrentLoadBalancer:
         except Exception as e:
             logger.error(f"添加种子到实例失败 - 实例：{instance.name}，种子：{torrent.release_name}，错误：{e}")
             return False
+    
+    def _schedule_torrent_monitoring(self, instance: InstanceInfo, torrent: PendingTorrent) -> None:
+        """将新种子添加到快速汇报监控列表（异步获取hash）"""
+        def find_and_add_to_monitor():
+            try:
+                # 等待2秒让qBittorrent处理种子
+                time.sleep(2)
+                
+                # 查询该实例最近添加的种子
+                torrents = instance.client.torrents_info(sort='added_on', reverse=True, limit=10)
+                
+                # 查找匹配的种子（通过名称匹配）
+                for t in torrents:
+                    if t.name == torrent.release_name or torrent.release_name in t.name:
+                        # 检查分类是否在黑名单中
+                        blacklist = self.config.get('fast_announce_category_blacklist', [])
+                        if blacklist and hasattr(t, 'category') and t.category in blacklist:
+                            logger.debug(f"跳过快速汇报监控: {t.name} (分类 '{t.category}' 在黑名单中)")
+                            return
+                        
+                        with self.monitored_torrents_lock:
+                            self.monitored_torrents[t.hash] = MonitoredTorrent(
+                                instance_name=instance.name,
+                                torrent_hash=t.hash,
+                                torrent_name=t.name,
+                                added_time=datetime.now(),
+                                retry_count=0
+                            )
+                        logger.info(f"添加到快速汇报监控: {t.name} (实例: {instance.name})")
+                        return
+                
+                logger.warning(f"未能在实例 {instance.name} 中找到刚添加的种子: {torrent.release_name}")
+                
+            except Exception as e:
+                logger.warning(f"添加种子到监控列表失败: {torrent.release_name}, 错误: {e}")
+        
+        # 在独立线程中执行，避免阻塞
+        threading.Thread(target=find_and_add_to_monitor, daemon=True).start()
             
     def _process_torrents(self) -> None:
         """处理待分配的torrent URL"""
@@ -834,13 +933,31 @@ class QBittorrentLoadBalancer:
                 
             # 处理所有待处理的torrent URL
             for torrent in self.pending_torrents[:]:  # 使用切片避免修改列表时的问题
-                instance = self._select_best_instance()
-                if instance:
+                failed_instances = []  # 记录失败的实例，用于故障转移
+                success = False
+                
+                # 尝试所有可用实例，直到成功或没有更多可用实例
+                while True:
+                    instance = self._select_best_instance(exclude_instances=failed_instances)
+                    if not instance:
+                        if failed_instances:
+                            logger.error(f"所有实例都无法添加种子，放弃：{torrent.release_name}")
+                        else:
+                            logger.warning("没有可用的实例来分配新任务，清空待处理队列")
+                            self.pending_torrents.clear()
+                        break
+                    
                     if self._add_torrent_to_instance(instance, torrent):
                         self.pending_torrents.remove(torrent)
-                else:
-                    logger.warning("没有可用的实例来分配新任务，清空待处理队列")
-                    self.pending_torrents.clear()
+                        success = True
+                        break
+                    else:
+                        # 添加失败，记录该实例并尝试下一个
+                        logger.warning(f"实例 {instance.name} 添加失败，尝试故障转移到下一个实例")
+                        failed_instances.append(instance)
+                
+                if not success and not failed_instances:
+                    # 没有可用实例，已经清空队列
                     break
 
     def _reset_task_counters(self) -> None:
@@ -864,25 +981,185 @@ class QBittorrentLoadBalancer:
             logger.debug(status_msg)
                 
     def status_update_thread(self) -> None:
-        """状态更新线程"""
+        """状态更新线程 - 定期更新所有实例的状态信息"""
         logger.info("状态更新线程启动")
+        status_interval = self.config['status_update_interval']
         
         while True:
             try:
-                self._update_instance_status()
+                self._update_instance_status_only()
                 self._log_status_summary()
                 self._check_and_schedule_reconnects()
-                              
-                # 根据是否有待重试的汇报任务来调整检查频率
-                fast_interval = self.config['fast_announce_interval']
-                if self.announce_retry_counts:
-                    time.sleep(fast_interval)  # 有待重试任务时的快速检查频率
-                else:
-                    time.sleep(fast_interval * 2)  # 正常情况下的检查频率
+                time.sleep(status_interval)
                 
             except Exception as e:
                 logger.error(f"状态更新线程错误：{e}")
                 time.sleep(ERROR_RETRY_SLEEP)
+    
+    def fast_announce_thread(self) -> None:
+        """快速汇报线程 - 只处理监控列表中的新种子"""
+        logger.info("快速汇报线程启动")
+        fast_interval = self.config['fast_announce_interval']
+        max_retries = self.config.get('max_announce_retries', 30)
+        
+        while True:
+            try:
+                if not self.config.get('fast_announce_enabled', False):
+                    time.sleep(fast_interval * 2)
+                    continue
+                
+                self._process_monitored_torrents(max_retries)
+                
+                # 只在有监控任务时使用快速间隔
+                with self.monitored_torrents_lock:
+                    has_monitored = len(self.monitored_torrents) > 0
+                
+                if has_monitored:
+                    time.sleep(fast_interval)
+                else:
+                    time.sleep(fast_interval * 2)
+                    
+            except Exception as e:
+                logger.error(f"快速汇报线程错误：{e}")
+                time.sleep(ERROR_RETRY_SLEEP)
+    
+    def _process_monitored_torrents(self, max_retries: int) -> None:
+        """处理监控列表中的种子"""
+        error_keywords = ["unregistered", "not registered", "not found", "not exist"]
+        current_time = datetime.now()
+        torrents_to_remove = []
+        
+        with self.monitored_torrents_lock:
+            monitored_copy = dict(self.monitored_torrents)
+        
+        for torrent_hash, monitored in monitored_copy.items():
+            try:
+                # 获取实例
+                instance = self._get_instance_by_name(monitored.instance_name)
+                if not instance or not instance.is_connected:
+                    logger.warning(f"实例 {monitored.instance_name} 不可用，移除监控: {monitored.torrent_name}")
+                    torrents_to_remove.append(torrent_hash)
+                    continue
+                
+                # 检查监控时间是否超过2分钟
+                age_seconds = (current_time - monitored.added_time).total_seconds()
+                if age_seconds > 140:
+                    logger.debug(f"监控超时，停止监控: {monitored.torrent_name}")
+                    torrents_to_remove.append(torrent_hash)
+                    continue
+                
+                # 检查重试次数
+                if monitored.retry_count >= max_retries:
+                    logger.debug(f"达到最大重试次数，停止监控: {monitored.torrent_name}")
+                    torrents_to_remove.append(torrent_hash)
+                    continue
+                
+                # 获取种子信息
+                try:
+                    torrent_info = instance.client.torrents_info(torrent_hashes=torrent_hash)
+                    if not torrent_info:
+                        logger.warning(f"种子不存在，移除监控: {monitored.torrent_name}")
+                        torrents_to_remove.append(torrent_hash)
+                        continue
+                    torrent = torrent_info[0]
+                except Exception as e:
+                    logger.warning(f"获取种子信息失败: {monitored.torrent_name}, 错误: {e}")
+                    continue
+                
+                # 检查是否已完成
+                if torrent.progress == 1.0:
+                    logger.debug(f"种子已完成，停止监控: {monitored.torrent_name}")
+                    torrents_to_remove.append(torrent_hash)
+                    continue
+                
+                # 增加重试计数
+                with self.monitored_torrents_lock:
+                    if torrent_hash in self.monitored_torrents:
+                        self.monitored_torrents[torrent_hash].retry_count += 1
+                        current_retries = self.monitored_torrents[torrent_hash].retry_count
+                
+                # 检查是否需要强制汇报（1分钟和2分钟时）
+                fast_interval = self.config.get('fast_announce_interval', 3)
+                first_force = int(60 / fast_interval)
+                second_force = int(120 / fast_interval)
+                if current_retries in (first_force, second_force):
+                    logger.info(f"强制汇报(第{current_retries}次): {monitored.torrent_name}")
+                    instance.client.torrents_reannounce(torrent_hashes=torrent_hash)
+                    continue
+                
+                # 正常汇报条件检查
+                needs_announce, reason = self._check_announce_needed(instance, torrent_hash, torrent, error_keywords)
+                if needs_announce:
+                    instance.client.torrents_reannounce(torrent_hashes=torrent_hash)
+                    logger.info(f"触发汇报: {monitored.torrent_name} (原因: {reason}) | 尝试次数: {current_retries}")
+                    
+            except Exception as e:
+                logger.warning(f"处理监控种子时出错: {monitored.torrent_name}, 错误: {e}")
+        
+        # 移除已完成或超时的种子
+        if torrents_to_remove:
+            with self.monitored_torrents_lock:
+                for h in torrents_to_remove:
+                    self.monitored_torrents.pop(h, None)
+    
+    def _check_announce_needed(self, instance: InstanceInfo, torrent_hash: str, torrent, error_keywords: list) -> tuple:
+        """检查是否需要汇报，返回 (需要汇报, 原因)"""
+        reasons = []
+        
+        try:
+            trackers = instance.client.torrents_trackers(torrent_hash=torrent_hash)
+            
+            # 过滤有效的HTTP trackers
+            filtered_trackers = [t for t in trackers 
+                               if t.url.lower() not in ('dht', 'pex', 'lsd') 
+                               and t.url.startswith(('http://', 'https://'))]
+            
+            if not filtered_trackers:
+                return False, ""
+            
+            all_trackers_failed = all(t.status in [1, 3, 4] for t in filtered_trackers)
+            has_error_keyword = any(keyword in t.msg.lower() for t in filtered_trackers for keyword in error_keywords)
+            
+            if all_trackers_failed:
+                reasons.append("所有tracker状态异常")
+            if has_error_keyword:
+                reasons.append("发现tracker错误信息")
+            
+            # 检查Peer数量
+            if torrent.progress < 0.8 and torrent.num_leechs < 2:
+                reasons.append(f"Peer数量不足({torrent.num_leechs})")
+            
+            return len(reasons) > 0, ", ".join(reasons)
+            
+        except Exception as e:
+            logger.warning(f"检查汇报条件时出错: {e}")
+            return False, ""
+    
+    def _get_instance_by_name(self, name: str) -> Optional[InstanceInfo]:
+        """根据名称获取实例"""
+        with self.instances_lock:
+            for instance in self.instances:
+                if instance.name == name:
+                    return instance
+        return None
+    
+    def _update_instance_status_only(self) -> None:
+        """仅更新实例状态，不进行汇报检查"""
+        with self.instances_lock:
+            for instance in self.instances:
+                if instance.is_connected:
+                    self._update_single_instance_status_only(instance)
+    
+    def _update_single_instance_status_only(self, instance: InstanceInfo) -> None:
+        """仅更新单个实例的状态信息"""
+        try:
+            maindata = instance.client.sync_maindata()
+            self._update_instance_metrics(instance, maindata)
+        except Exception as e:
+            logger.warning(f"更新实例状态失败：{instance.name}，错误：{e}")
+            # 标记为断开连接
+            instance.is_connected = False
+            instance.last_update = datetime.now()
                 
     def task_processor_thread(self) -> None:
         """任务处理线程"""
@@ -916,6 +1193,10 @@ class QBittorrentLoadBalancer:
         # 启动任务处理线程
         task_thread = threading.Thread(target=self.task_processor_thread, daemon=True)
         task_thread.start()
+        
+        # 启动快速汇报线程
+        announce_thread = threading.Thread(target=self.fast_announce_thread, daemon=True)
+        announce_thread.start()
         
         try:
             # 主线程保持运行
